@@ -7,6 +7,8 @@ import pandas as pd
 import plotly.express as px
 from sklearn.svm import SVC
 from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import accuracy_score
 
 # --- 1. 기본 설정 및 데이터 전처리 (캐싱으로 로딩 속도 최적화) ---
 st.set_page_config(page_title="ㅐ/ㅔ 발음 분류 AI", layout="wide")
@@ -49,23 +51,44 @@ def prepare_data():
         except:
             pass
             
-    return pd.DataFrame(data_list)
+    df = pd.DataFrame(data_list)
+    
+    if not df.empty:
+        # [결측치 및 이상치 처리 적용]
+        df = df.dropna(subset=['F1', 'F2'])
+        df = df[(df['F1'] > 300) & (df['F1'] < 1200)] 
+        df = df[(df['F2'] > 1200) & (df['F2'] < 3000)]
+        
+        # 참고: 데이터셋에 화자 ID가 명시되어 있다면, 
+        # 이곳에 동일 화자의 F1('ㅐ') - F1('ㅔ') > 임계값 필터링 로직을 추가할 수 있습니다.
+        
+    return df
 
 @st.cache_resource
 def train_model(df):
     X = df[['F1', 'F2']]
     y = df['라벨']
+    
     scaler = StandardScaler()
     X_scaled = scaler.fit_transform(X)
     
+    # [80/20 데이터 분할 적용]
+    X_train, X_test, y_train, y_test = train_test_split(X_scaled, y, test_size=0.2, random_state=42)
+    
+    # 모델 학습
     model = SVC(kernel='rbf', probability=True, random_state=42)
-    model.fit(X_scaled, y)
-    return model, scaler
+    model.fit(X_train, y_train)
+    
+    # [정확도 계산 적용]
+    y_pred = model.predict(X_test)
+    accuracy = accuracy_score(y_test, y_pred) * 100
+    
+    return model, scaler, accuracy
 
 # 데이터 로드 및 모델 학습
 df = prepare_data()
 if not df.empty:
-    model, scaler = train_model(df)
+    model, scaler, accuracy = train_model(df)
 
 # --- 2. 웹앱 화면 구성 ---
 st.title("🎙️ 한국어 'ㅐ' / 'ㅔ' 발음 분류 인공지능")
@@ -88,41 +111,81 @@ with tab2:
     """)
 
 with tab1:
-    st.write(f"✅ 총 **{len(df)}개**의 발음 데이터를 성공적으로 학습했습니다.")
+    st.write(f"✅ 총 **{len(df)}개**의 발음 데이터 학습 완료 (이상치 필터링 적용됨)")
+    st.write(f"🎯 테스트 데이터(20%) 기준 모델 분류 정확도: **{accuracy:.1f}%**")
     
     col1, col2 = st.columns([1, 2])
     
     with col1:
         st.subheader("1. 음성 입력")
+        
+        # [다중 음성 입력을 위한 세션 상태 초기화]
+        if 'audio_history' not in st.session_state:
+            st.session_state.audio_history = []
+            
         audio_value = st.audio_input("직접 '개' 또는 '게'를 녹음해 보세요!")
         uploaded_file = st.file_uploader("또는 wav 파일을 업로드하세요.", type=["wav"])
         
-        audio_to_analyze = audio_value if audio_value else uploaded_file
+        new_audio = audio_value if audio_value else uploaded_file
         
-        if audio_to_analyze:
-            st.subheader("2. 분석 결과")
-            with open("temp_input.wav", "wb") as f:
-                f.write(audio_to_analyze.read())
+        # 새로운 입력이 들어오면 리스트에 추가
+        if new_audio and new_audio not in st.session_state.audio_history:
+            st.session_state.audio_history.append(new_audio)
             
-            try:
-                sound_test = parselmouth.Sound("temp_input.wav")
-                formant_test = sound_test.to_formant_burg(max_number_of_formants=5.0, maximum_formant=5500.0)
-                mid_point = sound_test.get_total_duration() / 2
-                test_f1 = formant_test.get_value_at_time(1, mid_point)
-                test_f2 = formant_test.get_value_at_time(2, mid_point)
+        # [삭제 기능 UI 구성]
+        col_btn1, col_btn2 = st.columns(2)
+        with col_btn1:
+            if st.button("⏪ 최근 녹음 삭제") and st.session_state.audio_history:
+                st.session_state.audio_history.pop()
+                st.rerun()
+        with col_btn2:
+            if st.button("🗑️ 전체 녹음 삭제") and st.session_state.audio_history:
+                st.session_state.audio_history.clear()
+                st.rerun()
+        
+        # 산점도에 그릴 마커 데이터를 모아둘 리스트
+        analyzed_points = []
+        
+        if st.session_state.audio_history:
+            st.subheader("2. 분석 결과")
+            
+            # 누적된 음성 기록을 모두 분석하여 출력
+            for idx, audio_data in enumerate(st.session_state.audio_history):
+                st.markdown(f"**🎤 {idx + 1}번째 녹음**")
+                st.audio(audio_data)
                 
-                if pd.notna(test_f1):
-                    X_test = scaler.transform([[test_f1, test_f2]])
-                    prediction = model.predict(X_test)[0]
-                    prob = model.predict_proba(X_test)[0]
-                    max_prob = max(prob) * 100
+                with open(f"temp_input_{idx}.wav", "wb") as f:
+                    f.write(audio_data.read())
+                    audio_data.seek(0) # 다음 읽기를 위해 파일 포인터 초기화
+                
+                try:
+                    sound_test = parselmouth.Sound(f"temp_input_{idx}.wav")
+                    formant_test = sound_test.to_formant_burg(max_number_of_formants=5.0, maximum_formant=5500.0)
+                    mid_point = sound_test.get_total_duration() / 2
+                    test_f1 = formant_test.get_value_at_time(1, mid_point)
+                    test_f2 = formant_test.get_value_at_time(2, mid_point)
                     
-                    st.success(f"당신의 발음은 **{prediction}** 입니다! (확률: {max_prob:.1f}%)")
-                    st.info(f"📍 추출된 주파수 - F1(혀 높이): {test_f1:.1f}Hz, F2(혀 앞뒤): {test_f2:.1f}Hz")
-                else:
-                    st.error("모음 구간을 찾을 수 없습니다. 다시 녹음해 주세요.")
-            except Exception as e:
-                st.error("음성 분석 중 오류가 발생했습니다.")
+                    if pd.notna(test_f1):
+                        X_test = scaler.transform([[test_f1, test_f2]])
+                        prediction = model.predict(X_test)[0]
+                        prob = model.predict_proba(X_test)[0]
+                        max_prob = max(prob) * 100
+                        
+                        st.success(f"결과: **{prediction}** (확률: {max_prob:.1f}%)")
+                        st.caption(f"📍 F1(혀 높이): {test_f1:.1f}Hz, F2(혀 앞뒤): {test_f2:.1f}Hz")
+                        
+                        # 산점도 마커용 데이터 저장
+                        analyzed_points.append({
+                            "idx": idx + 1, 
+                            "F1": test_f1, 
+                            "F2": test_f2, 
+                            "prediction": prediction
+                        })
+                    else:
+                        st.error("모음 구간을 찾을 수 없습니다.")
+                except Exception as e:
+                    st.error("음성 분석 중 오류가 발생했습니다.")
+                st.divider()
                 
     with col2:
         st.subheader("3. 포먼트 공간 분포도")
@@ -133,10 +196,12 @@ with tab1:
         fig.update_yaxes(autorange="reversed") # 음성학 관례에 따라 F1 역순 배치
         fig.update_xaxes(autorange="reversed") # 음성학 관례에 따라 F2 역순 배치
         
-        # 사용자 발음 위치 마커 추가
-        if audio_to_analyze and 'test_f1' in locals() and pd.notna(test_f1):
-            fig.add_scatter(x=[test_f2], y=[test_f1], mode='markers', 
-                            marker=dict(size=15, color='red', symbol='star'),
-                            name="내 발음")
+        # 누적된 사용자 발음 위치 마커 추가
+        for pt in analyzed_points:
+            marker_color = 'red' if 'ae' in pt['prediction'] else 'orange'
+            fig.add_scatter(x=[pt['F2']], y=[pt['F1']], mode='markers+text',
+                            text=[f"#{pt['idx']}"], textposition="top center",
+                            marker=dict(size=15, color=marker_color, symbol='star', line=dict(width=1, color='black')),
+                            name=f"내 발음 #{pt['idx']}")
             
         st.plotly_chart(fig, use_container_width=True)
