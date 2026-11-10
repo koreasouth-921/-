@@ -1,6 +1,5 @@
 streamlit>=1.36.0
-librosa
-numpy
+praat-parselmouth
 pandas
 scikit-learn
 plotly
